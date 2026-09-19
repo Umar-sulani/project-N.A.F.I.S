@@ -1,3 +1,5 @@
+import json
+from datetime import datetime, timezone
 import re
 import pickle
 import os
@@ -7,6 +9,7 @@ import time
 import numpy as np
 import torch
 import sys  # Import sys for sys.exit()
+import pymupdf # bruh i cant belive it took me an hour to realize i forgot to import it
 
 # --- CadQuery Imports (NEW) ---
 import cadquery as cq  # Main CadQuery library
@@ -29,8 +32,8 @@ from nltk.stem import WordNetLemmatizer
 print("--- My tools are ready! ---")
 
 # --- For Gemini API Integration ---
-import google.generativeai as genai
-import google.api_core.exceptions
+from google import genai as genai
+from google.genai import errors as genai_errors
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -39,9 +42,10 @@ load_dotenv()
 from sentence_transformers import SentenceTransformer, util
 
 # --- Global Constants ---
+GEMINI_MODEL_NAME = "gemini-3.5-flash"
 MODEL_DIR = 'chatbot_model'
 CHAT_MEMORY_PATH = os.path.join(MODEL_DIR, 'chat_memory.pkl')
-LEARNED_QA_FILE = os.path.join(MODEL_DIR, "learned_qa.txt")
+LEARNED_QA_FILE = os.path.join(MODEL_DIR, "learned_qa.jsonl")
 PRE_LEARNED_FACTS_FILE = os.path.join(MODEL_DIR, "pre_learned_facts.txt")
 QA_EMBEDDINGS_PATH = os.path.join(MODEL_DIR, "qa_embeddings.pkl")
 
@@ -61,10 +65,9 @@ else:
     print(f"DEBUG: GEMINI_API_KEY loaded successfully (starts with '{GEMINI_API_KEY[:5]}...').")
 
 # Global variable for the Gemini model name, will be set after checking availability
-GEMINI_MODEL_NAME = 'gemini-1.5-flash-latest'  # Default, will be set after checks
 
 try:
-    genai.configure(api_key=GEMINI_API_KEY)
+    client = genai.Client()
 except Exception as e:
     print(
         f"\nHmm, something's not quite right with connecting to Gemini API. Please double-check your API key and internet connection. ({e})")
@@ -94,14 +97,14 @@ last_generated_stl_file = None
 # --- Data Sources (Initial Corpus) ---
 initial_raw_corpus = [
     ("hi there", "hello how are you"),
-    ("what's your name", "i am a chatbot"),
+    ("what's your name", "i am N.A.F.I.S "),
     ("how are you doing", "i am doing well thank you"),
     ("tell me a joke", "why did the scarecrow win an award because he was outstanding in his field"),
     ("goodbye", "see you later"),
     ("i am sad", "i am sorry to hear that"),
     ("where are you from", "i am from the internet"),
     ("can you help me", "yes i can help you"),
-    ("who built you", "i was built by a programmer"),
+    ("who built you", "i was built by mr_hex_agon \n go check out his work on github!"),
     ("how old are you", "i do not have an age"),
     ("are you intelligent", "i am a program so i do not have intelligence"),
     ("what do you like to do", "i like to process information"),
@@ -123,6 +126,37 @@ def normalize_text_for_lookup(text):
     tokens = [lemmatizer.lemmatize(w) for w in tokens]
     return " ".join(tokens)
 
+# -- i added new functions for remebering leared ddata better as old one got currupted
+
+def append_learned_qa(path, question, answer, source):
+    """Append one Q&A record as a single JSON line."""
+    record = {
+        "q": question,
+        "a": answer,
+        "source": source,
+        "ts": datetime.now(timezone.utc).isoformat(),
+    }
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def load_learned_qa(path):
+    """Return a list of (question, answer) tuples. Bad lines are skipped, not fatal."""
+    pairs = []
+    if not os.path.exists(path):
+        return pairs
+    with open(path, "r", encoding="utf-8") as f:
+        for line_no, line in enumerate(f, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+                pairs.append((rec["q"], rec["a"]))
+            except (json.JSONDecodeError, KeyError):
+                print(f"Skipping malformed line {line_no} in {path}")
+    return pairs
 
 # --- Web Scraping Function (Remains the same) ---
 def scrape_qa_from_url(url):
@@ -183,28 +217,25 @@ def scrape_qa_from_url(url):
 def list_available_gemini_models():
     print("\nChatbot: Checking which Gemini models are available to me...")
     try:
-        print("--- Available Gemini Models (supporting generateContent) ---")
+        print("--- Available Gemini Models ---")
         found_models = False
-        for m in genai.list_models():
-            if m.name.startswith('models/') and 'generateContent' in m.supported_generation_methods:
+        for m in client.models.list():
+            if "generateContent" in (m.supported_actions or []):
                 print(f"  - {m.name}")
                 found_models = True
         if not found_models:
             print("  No models supporting 'generateContent' found for your API key.")
-            print("  This might indicate an issue with your API key, regional availability, or billing setup.")
         print("---------------------------------------------------------")
-        print(
-            "\nChatbot: If 'gemini-pro' isn't working, try setting 'GEMINI_MODEL_NAME' in main.py to one of the names above (e.g., 'gemini-1.5-flash-latest').")
+        print("\nChatbot: Set GEMINI_MODEL_NAME near the top of the file to one of the names above.")
     except Exception as e:
         print(f"Chatbot: Ran into an issue trying to list models: {e}")
-        print("Chatbot: Please ensure your API key is correct and you have internet access.")
 
 
 # --- PDF Processing Functions (Remain a copy) ---
 def extract_text_from_pdf(pdf_path):
     text = ""
     try:
-        doc = fitz.open(pdf_path)
+        doc = pymupdf.open(pdf_path)
         for page_num in range(doc.page_count):
             page = doc.load_page(page_num)
             text += page.get_text()
@@ -275,12 +306,13 @@ def get_answer_from_gemini(query, chat_session):
             return response.text.strip()
         else:
             return "Gemini didn't give me a clear answer for that. Maybe try rephrasing?"
-    except google.api_core.exceptions.NotFound as e:
-        print(
-            f"Chatbot: Oh no! It seems the model '{GEMINI_MODEL_NAME}' isn't found or supported for this type of query.")
-        print("Chatbot: This often means you need to use a different model name.")
-        list_available_gemini_models()
-        return "I encountered a problem because my current Gemini model isn't available. Please try again or use the 'list_models' command."
+    except genai_errors.APIError as e:
+        if e.code == 404:
+            print(f"Chatbot: The model '{GEMINI_MODEL_NAME}' isn't found or supported.")
+            list_available_gemini_models()
+            return "I encountered a problem because my current Gemini model isn't available. Please try again or use the 'list_models' command."
+        print(f"Chatbot: Gemini API error {e.code}: {e.message}")
+        return "I encountered an unexpected problem while trying to get information from Gemini."
     except Exception as e:
         print(f"Chatbot: An unexpected error occurred while contacting Gemini: {e}")
         return "I encountered an unexpected problem while trying to get information from Gemini."
@@ -348,18 +380,11 @@ def initialize_chatbot():
                     print(f"Heads up: Found a slightly odd line in {PRE_LEARNED_FACTS_FILE}: {line.strip()}")
     print(f"Loaded {pre_learned_facts_count} handy pre-learned Q&A pairs.")
 
-    learned_data_count = 0
-    if os.path.exists(LEARNED_QA_FILE):
-        print(f"Remembering past conversations by loading from {LEARNED_QA_FILE}...")
-        with open(LEARNED_QA_FILE, 'r', encoding='utf-8') as f:
-            for line in f:
-                parts = line.strip().split(':::', 1)
-                if len(parts) == 2:
-                    add_qa_to_corpus(parts[0], parts[1])
-                    learned_data_count += 1
-                else:
-                    print(f"Heads up: Found a slightly odd line in {LEARNED_QA_FILE}: {line.strip()}")
-    print(f"Recalled {learned_data_count} things we've learned together!")
+    learned_pairs = load_learned_qa(LEARNED_QA_FILE)
+    for q, a in learned_pairs:
+        add_qa_to_corpus(q, a)
+    learned_data_count = len(learned_pairs)
+    print(f"Recalled {learned_data_count} things learned")
 
     print(f"All set! My local brain now knows about {len(qa_corpus_for_embedding)} unique questions.")
 
@@ -374,7 +399,7 @@ def initialize_chatbot():
                     print("My knowledge changed a bit. Re-generating embeddings now...")
                     qa_embeddings = sentence_transformer_model.encode(qa_corpus_for_embedding, convert_to_tensor=True)
                     with open(QA_EMBEDDINGS_PATH, 'wb') as f:
-                        pickle.dump({'qa_corpus': qa_corpus_for_embedding, 'embeddings': qa_embeddings}, f)
+                        pickle.dump({'qa_corpus': qa_corpus_for_embedding_ref, 'embeddings': qa_embeddings_ref}, f)
                     print("New Q&A embeddings generated and saved. All up-to-date!")
         except Exception as e:
             print(f"Oops, ran into a problem loading embeddings: {e}. I'll just re-generate them from scratch.")
@@ -512,11 +537,11 @@ def process_query(user_input, chatbot_state, chat_session):
                 qa_embeddings_ref = new_embedding.unsqueeze(0)
             chatbot_state['qa_embeddings'] = qa_embeddings_ref
 
-            with open(LEARNED_QA_FILE, 'a', encoding='utf-8') as f:
-                f.write(f"{user_input}:::{response}\n")
+            append_learned_qa(LEARNED_QA_FILE, user_input, response, source="gemini")
+
             with open(QA_EMBEDDINGS_PATH, 'wb') as f:
                 pickle.dump({'qa_corpus': qa_corpus_for_embedding_ref, 'embeddings': qa_embeddings_ref}, f)
-            print(f"Chatbot: Cool! I just learned something new from Gemini and saved it to my general memory!")
+            print(f"Chatbot: Coolio! I just learned something new from Gemini and saved it to my general memory!")
     else:
         response = "Gosh, I'm having a bit of trouble with that one. My local knowledge isn't strong enough, and Gemini isn't giving me a clear answer either. Could you try asking something else, or rephrasing it?"
         source_of_answer = "None (Couldn't figure it out)"
@@ -837,8 +862,7 @@ def chat():
     global gemini_chat_session, current_pdf_chunks_data, last_generated_stl_file
 
     try:
-        model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-        gemini_chat_session = model.start_chat(history=[])
+        gemini_chat_session = client.chats.create(model=GEMINI_MODEL_NAME)
         print(f"Chatbot: I've started a new conversation session with Gemini using model '{GEMINI_MODEL_NAME}'.")
     except Exception as e:
         print(f"Chatbot: Failed to start Gemini chat session with model '{GEMINI_MODEL_NAME}': {e}")
@@ -862,9 +886,8 @@ def chat():
                 "Chatbot: Okay, what's the URL you'd like me to scrape Q&A from? (e.g., https://www.example.com/faq): ")
             new_qa_pairs = scrape_qa_from_url(website_url)
             if new_qa_pairs:
-                with open(LEARNED_QA_FILE, 'a', encoding='utf-8') as f:
-                    for q, a in new_qa_pairs:
-                        f.write(f"{q}:::{a}\n")
+                for q, a in new_qa_pairs:
+                    append_learned_qa(LEARNED_QA_FILE, q, a, source="scrape")
                 print(
                     f"\nChatbot: Done scraping! I've added {len(new_qa_pairs)} new Q&A pairs to my {LEARNED_QA_FILE} file.")
                 print(
@@ -884,12 +907,10 @@ def chat():
         elif user_input.lower() == 'new_topic':
             if gemini_chat_session:
                 try:
-                    model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-                    gemini_chat_session = model.start_chat(history=[])
+                    gemini_chat_session = client.chats.create(model=GEMINI_MODEL_NAME)
                     current_pdf_chunks_data = None
                     last_generated_stl_file = None  # Clear last generated file on new topic
-                    print(
-                        "Chatbot: Okay, I've cleared our conversation history and any loaded PDF. Let's talk about something new!")
+                    print("Chatbot: Okay, I've cleared our conversation history and any loaded PDF. Let's talk about something new!")
                 except Exception as e:
                     print(f"Chatbot: Couldn't start a new chat session to clear context: {e}")
             else:
@@ -1126,7 +1147,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     try:
-        import fitz
+        import pymupdf
     except ImportError:
         print("\nAh, the PDF reader library (PyMuPDF) isn't installed!")
         print("Please install it by running: pip install PyMuPDF")
