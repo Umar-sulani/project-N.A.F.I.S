@@ -20,6 +20,10 @@ import nltk
 nltk.download('wordnet')
 ```
 
+dont forget to import your google API key if you dont haveone you can it it from https://aistudio.google.com/api-keys
+
+enter your API key at line 56 : `GEMINI_API_KEY = "GEMINI_API_KEY"`
+
 after that youre pretty much set to go just run this in the terminal to start it:
 ```
 python main.py
