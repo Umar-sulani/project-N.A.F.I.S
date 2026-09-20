@@ -13,6 +13,7 @@ pip install nltk
 pip install google.genai
 pip install dotenv
 pip install pymupdf
+pip install sentence-transformers
 ```
 also run this in a terminal/ command prompt in the same folder as the project:
 ```
